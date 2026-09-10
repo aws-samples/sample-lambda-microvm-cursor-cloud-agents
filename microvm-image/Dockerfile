@@ -1,0 +1,43 @@
+ARG BASE_IMAGE=public.ecr.aws/lambda/microvms:al2023-minimal
+FROM ${BASE_IMAGE}
+# To FROM a private ECR application image instead, see Dockerfile.ecr and the
+# README section "Bring your own ECR image". --base-image-arn stays a
+# Lambda-managed OS from list-managed-microvm-images.
+
+RUN dnf install -y --setopt=install_weak_deps=0 \
+      bash tar gzip git ca-certificates findutils awscli python3 \
+      $(command -v curl >/dev/null 2>&1 || echo curl) && \
+    dnf clean all
+
+# Empty cursor-agent-version / CURSOR_AGENT_VERSION = public installer.
+# create-microvm-image zips this directory and may not pass --build-arg.
+COPY cursor-agent-version /tmp/cursor-agent-version
+ARG CURSOR_AGENT_VERSION=
+# Guest MicroVMs here are aarch64. The previous x64 default installed a node
+# binary that failed at runtime with "cannot execute binary file".
+ARG CURSOR_AGENT_ARCH=arm64
+RUN VERSION="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' /tmp/cursor-agent-version | sed -e '/^$/d' | head -n 1)" && \
+    VERSION="${VERSION:-${CURSOR_AGENT_VERSION:-}}" && \
+    ARCH="${CURSOR_AGENT_ARCH:-arm64}" && \
+    echo "installing cursor-agent ${VERSION:-prod} linux/${ARCH} (build uname=$(uname -m))" && \
+    if [ -n "${VERSION}" ]; then \
+      mkdir -p "/root/.local/share/cursor-agent/versions/${VERSION}" /root/.local/bin && \
+      curl -fsSL "https://downloads.cursor.com/lab/${VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
+        | tar --strip-components=1 -xzf - -C "/root/.local/share/cursor-agent/versions/${VERSION}" && \
+      ln -sf "/root/.local/share/cursor-agent/versions/${VERSION}/cursor-agent" /root/.local/bin/agent && \
+      ln -sf "/root/.local/share/cursor-agent/versions/${VERSION}/cursor-agent" /root/.local/bin/cursor-agent; \
+    else \
+      echo "ERROR: pin a cursor-agent version in microvm-image/cursor-agent-version (or pass --build-arg CURSOR_AGENT_VERSION) so the agent is installed from the versioned, verifiable tarball. The unpinned installer path has been removed for supply-chain safety." >&2 && exit 1; \
+    fi && \
+    ln -sf /root/.local/bin/agent /usr/local/bin/agent && \
+    ln -sf /root/.local/bin/agent /usr/local/bin/cursor-agent && \
+    rm -f /tmp/cursor-agent-version
+
+ENV PATH="/root/.cursor/bin:/root/.local/bin:/usr/local/bin:${PATH}"
+ENV HOME=/root
+ENV NODE_COMPILE_CACHE=/tmp/cursor-compile-cache
+WORKDIR /opt/cursor
+COPY entrypoint.sh hook.py /opt/cursor/
+RUN chmod +x /opt/cursor/entrypoint.sh /opt/cursor/hook.py && mkdir -p /opt/cursor/workspaces
+ENV HOOK_PORT=9000
+ENTRYPOINT ["python3", "/opt/cursor/hook.py"]

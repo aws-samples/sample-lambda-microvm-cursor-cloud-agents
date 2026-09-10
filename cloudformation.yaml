@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cursor pool-worker Lambda MicroVMs plus a scheduled controller Lambda.
+  EventBridge rate(1 minute) keeps the controller available; each invoke runs
+  `agent worker controller --spawn ./spawn.sh` for 5 minutes (SSE poll window)
+  and exits. ReservedConcurrentExecutions is 1 so controllers never overlap.
+  Throttled ticks are dropped. A DLQ records a crash; the next schedule is the restart.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cursor-lambda-workers
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,40}[a-z0-9]$"
+  ControllerImageUri:
+    Type: String
+    Description: ECR image URI for the controller Lambda (controller/Dockerfile). Build with ./deploy.sh.
+  PoolNames:
+    Type: String
+    Default: ""
+    Description: >-
+      Comma-separated pool names for `agent worker controller --pool` (repeatable).
+      Mutually exclusive with AllPools=true. Set PoolNames, AllPools, and/or RepositoryUrls.
+  AllPools:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: If true, pass `--all-pools` (team-wide). Mutually exclusive with PoolNames.
+  RepositoryUrls:
+    Type: String
+    Default: ""
+    Description: >-
+      Comma-separated repository URLs for `agent worker controller --repository`.
+      Required for repo-scoped API keys. Can combine with PoolNames or AllPools.
+  MicroVmImageIdentifier:
+    Type: String
+    Default: cursor-pool-worker
+    Description: MicroVM image name or ARN that spawn.sh passes to RunMicrovm.
+  CursorApiKeyParamName:
+    Type: String
+    Default: /cursor-lambda-workers/cursor-api-key
+    Description: SSM SecureString the controller and MicroVM read for CURSOR_API_KEY.
+
+Conditions:
+  ImageIsArn: !Equals [!Select [0, !Split [":", !Ref MicroVmImageIdentifier]], "arn"]
+
+Resources:
+  # Destination bucket for S3 server access logs (required to enable access
+  # logging on ArtifactBucket). Encrypted, versioned, and fully private.
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-access-logs-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Grants the S3 server-access-logging service principal permission to write
+  # logs into AccessLogsBucket. This is the ACL-free mechanism (ACLs are
+  # disabled by BucketOwnerEnforced ObjectOwnership); it replaces the legacy
+  # AccessControl: LogDeliveryWrite grant.
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ServerAccessLogging
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogsBucket.Arn}/*"
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt ArtifactBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: artifact-access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  MicroVmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-microvm-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: ["sts:AssumeRole", "sts:TagSession"]
+      Policies:
+        - PolicyName: guest
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/*"
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: ["sts:AssumeRole", "sts:TagSession"]
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject"]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/*"
+              # Private ECR FROM during create-microvm-image. GetAuthorizationToken
+              # does not support resource-level IAM (same as AWS's sample).
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !Sub "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"
+
+  SpawnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-spawn-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: run-microvm
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:RunMicroVm
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt MicroVmExecutionRole.Arn
+              - Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-controller-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: controller
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-controller*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/microvms/*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CursorApiKeyParamName}"
+              - Effect: Allow
+                Action: lambda:RunMicroVm
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt MicroVmExecutionRole.Arn
+              - Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ControllerDeadLetterQueue.Arn
+
+  ControllerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-controller-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ControllerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-controller"
+      PackageType: Image
+      Architectures: [x86_64]
+      # 5-minute SSE window plus time to SIGTERM the CLI; expected path is a clean exit, not a Lambda timeout.
+      Timeout: 360
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt ControllerDeadLetterQueue.Arn
+      Role: !GetAtt ControllerRole.Arn
+      Code:
+        ImageUri: !Ref ControllerImageUri
+      Environment:
+        Variables:
+          CONTROLLER_POOL_NAMES: !Ref PoolNames
+          CONTROLLER_ALL_POOLS: !Ref AllPools
+          CONTROLLER_REPOSITORY_URLS: !Ref RepositoryUrls
+          SPAWN_SCRIPT: /var/task/spawn.sh
+          CURSOR_AGENT_BIN: /usr/local/bin/agent
+          CONTROLLER_RUN_SECONDS: "300"
+          HOME: /tmp
+          NODE_COMPILE_CACHE: /tmp/cursor-compile-cache
+          CURSOR_API_URL: https://api.cursor.com
+          CURSOR_API_ENDPOINT: https://api.cursor.com
+          MICROVM_IMAGE_IDENTIFIER: !If
+            - ImageIsArn
+            - !Ref MicroVmImageIdentifier
+            - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${MicroVmImageIdentifier}"
+          MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicroVmExecutionRole.Arn
+          CURSOR_API_KEY_PARAM_NAME: !Ref CursorApiKeyParamName
+
+  PollRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-controller"
+      Description: >-
+        Keep the worker controller available. Each invoke runs one 5-minute SSE
+        poll window; reserved concurrency 1 drops overlapping ticks.
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: Controller
+          Arn: !GetAtt ControllerFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 0
+            MaximumEventAgeInSeconds: 60
+
+  PollPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ControllerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PollRule.Arn
+
+Outputs:
+  ControllerFunctionName:
+    Value: !Ref ControllerFunction
+  ControllerDeadLetterQueueUrl:
+    Value: !Ref ControllerDeadLetterQueue
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  BuildRoleArn:
+    Value: !GetAtt BuildRole.Arn
+  MicroVmExecutionRoleArn:
+    Value: !GetAtt MicroVmExecutionRole.Arn
+  SpawnRoleArn:
+    Value: !GetAtt SpawnRole.Arn
+  PoolNames:
+    Value: !Ref PoolNames
+  AllPools:
+    Value: !Ref AllPools
+  RepositoryUrls:
+    Value: !Ref RepositoryUrls

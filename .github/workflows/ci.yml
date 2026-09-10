@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Template shape
+        run: |
+          test -f spawn.sh
+          test -f deploy.sh
+          test -f cloudformation.yaml
+          test -f controller/Dockerfile
+          test -f controller/handler.py
+          test -f microvm-image/Dockerfile
+          test -f microvm-image/Dockerfile.ecr
+          test -f microvm-image/entrypoint.sh
+          test -f microvm-image/hook.py
+          test ! -f handler.mjs
+          test ! -f spawn.mjs
+          test ! -f package.json
+          test ! -d src
+          test ! -d test
+          grep -q "AWS::Lambda::Function" cloudformation.yaml
+          grep -q "AWS::Events::Rule" cloudformation.yaml
+          grep -q "ReservedConcurrentExecutions: 1" cloudformation.yaml
+          grep -q "rate(1 minute)" cloudformation.yaml
+          grep -q "CONTROLLER_POOL_NAMES" cloudformation.yaml
+          grep -q "CONTROLLER_REPOSITORY_URLS" cloudformation.yaml
+          grep -q "CONTROLLER_ALL_POOLS" cloudformation.yaml
+          grep -q "agent worker controller --spawn" controller/handler.py
+          grep -q "aws lambda-microvms run-microvm" spawn.sh
+          grep -q -- "--run-hook-payload" spawn.sh
+          grep -q 'endswith("/ready")' microvm-image/hook.py
+          grep -q 'endswith("/validate")' microvm-image/hook.py
+          grep -q 'endswith("/run")' microvm-image/hook.py
+          grep -q '"validate":"ENABLED"' README.md
+          grep -q "Bring your own ECR image" README.md
+          grep -q "ecr:GetAuthorizationToken" cloudformation.yaml
+          grep -q "ecr:BatchCheckLayerAvailability" cloudformation.yaml
+          grep -q "ecr:GetDownloadUrlForLayer" cloudformation.yaml
+          grep -q "ecr:BatchGetImage" cloudformation.yaml
+          grep -q "COPY entrypoint.sh hook.py" microvm-image/Dockerfile.ecr
+          grep -q 'ENTRYPOINT \["python3", "/opt/cursor/hook.py"\]' microvm-image/Dockerfile.ecr
