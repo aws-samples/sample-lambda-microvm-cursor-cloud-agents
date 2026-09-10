@@ -1,0 +1,11 @@
+# Pinned cursor-agent version (required). Installed from the versioned tarball at
+# downloads.cursor.com/lab/<VERSION>/linux/<arch>/agent-cli-package.tar.gz.
+#
+# To update: replace the version below with a newer release, then verify it exists
+# for both architectures before building (200 = OK):
+#   curl -fsSI https://downloads.cursor.com/lab/<VERSION>/linux/arm64/agent-cli-package.tar.gz
+#   curl -fsSI https://downloads.cursor.com/lab/<VERSION>/linux/x64/agent-cli-package.tar.gz
+#
+# If left empty (and no --build-arg CURSOR_AGENT_VERSION is passed) the build fails
+# by design: the unpinned "curl | bash" installer has been removed for supply-chain safety.
+2026.08.24-913e94d

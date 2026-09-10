@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.env.*
+*.pem
+*.key
+api_key
+aws
+.DS_Store
+app.zip
